@@ -1,0 +1,544 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Generate project
+        run: |
+          set -e
+          mkdir -p proj && cd proj
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.filetree"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.filetree"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              kotlinOptions { jvmTarget = "17" }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              packaging {
+                  resources {
+                      excludes += setOf(
+                          "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*",
+                          "META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "META-INF/INDEX.LIST",
+                          "plugin.properties", "about.html"
+                      )
+                  }
+              }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              implementation("org.eclipse.jgit:org.eclipse.jgit:5.13.3.202401111512-r")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="FileTree"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/filetree
+          cat > app/src/main/java/com/example/filetree/Git.kt <<'EOF_FILE'
+          package com.example.filetree
+
+          import android.content.Context
+          import org.eclipse.jgit.api.Git
+          import org.eclipse.jgit.lib.PersonIdent
+          import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider
+          import java.io.File
+
+          class Creds(ctx: Context) {
+              private val p = ctx.getSharedPreferences("git", Context.MODE_PRIVATE)
+              private fun get(k: String) = p.getString(k, "") ?: ""
+              private fun put(k: String, v: String) = p.edit().putString(k, v).apply()
+              var user: String get() = get("user"); set(v) = put("user", v)
+              var token: String get() = get("token"); set(v) = put("token", v)
+              var name: String get() = get("name"); set(v) = put("name", v)
+              var email: String get() = get("email"); set(v) = put("email", v)
+          }
+
+          object GitOps {
+              fun repoRoot(dir: File, root: File): File? {
+                  var d: File? = dir
+                  while (d != null) {
+                      if (File(d, ".git").exists()) return d
+                      if (d == root) return null
+                      d = d.parentFile
+                  }
+                  return null
+              }
+
+              private fun cp(c: Creds) = UsernamePasswordCredentialsProvider(c.user, c.token)
+
+              fun init(dir: File) = Git.init().setDirectory(dir).call().close()
+
+              fun clone(url: String, dir: File, c: Creds): String {
+                  val name = url.trim().trimEnd('/').substringAfterLast('/').removeSuffix(".git")
+                  require(name.isNotBlank()) { "Bad URL" }
+                  val target = File(dir, name)
+                  require(!target.exists()) { "$name already exists here" }
+                  Git.cloneRepository().setURI(url.trim()).setDirectory(target)
+                      .setCredentialsProvider(cp(c)).call().close()
+                  return "Cloned into $name"
+              }
+
+              fun remoteUrl(repo: File): String = Git.open(repo).use {
+                  it.repository.config.getString("remote", "origin", "url") ?: ""
+              }
+
+              fun setRemote(repo: File, url: String): String = Git.open(repo).use {
+                  val cfg = it.repository.config
+                  cfg.setString("remote", "origin", "url", url.trim())
+                  cfg.setString("remote", "origin", "fetch", "+refs/heads/*:refs/remotes/origin/*")
+                  cfg.save()
+                  "origin set to ${url.trim()}"
+              }
+
+              fun status(repo: File): String = Git.open(repo).use { g ->
+                  val s = g.status().call()
+                  buildString {
+                      appendLine("Branch: ${g.repository.branch}")
+                      if (s.isClean) append("Clean") else {
+                          (s.added + s.untracked).sorted().forEach { appendLine("+ $it") }
+                          (s.changed + s.modified).sorted().forEach { appendLine("M $it") }
+                          (s.removed + s.missing).sorted().forEach { appendLine("D $it") }
+                          s.conflicting.sorted().forEach { appendLine("! $it") }
+                      }
+                  }.trim()
+              }
+
+              fun commit(repo: File, msg: String, c: Creds): String = Git.open(repo).use { g ->
+                  require(msg.isNotBlank()) { "Write a commit message" }
+                  require(c.name.isNotBlank() && c.email.isNotBlank()) { "Set author name and email" }
+                  g.add().addFilepattern(".").call()
+                  g.add().setUpdate(true).addFilepattern(".").call()
+                  if (g.status().call().let { it.added.isEmpty() && it.changed.isEmpty() && it.removed.isEmpty() })
+                      return "Nothing to commit"
+                  val who = PersonIdent(c.name, c.email)
+                  val r = g.commit().setMessage(msg).setAuthor(who).setCommitter(who).call()
+                  "Committed ${r.abbreviate(7).name()}: $msg"
+              }
+
+              fun push(repo: File, c: Creds): String = Git.open(repo).use { g ->
+                  val sb = StringBuilder()
+                  val cmd = g.push().setRemote("origin").setCredentialsProvider(cp(c))
+                  g.repository.fullBranch?.let { cmd.add(it) }
+                  for (r in cmd.call()) for (u in r.remoteUpdates)
+                      sb.appendLine("${u.remoteName}: ${u.status}" + (u.message?.let { " - $it" } ?: ""))
+                  sb.toString().trim().ifBlank { "Pushed" }
+              }
+
+              fun pull(repo: File, c: Creds): String = Git.open(repo).use { g ->
+                  val r = g.pull().setCredentialsProvider(cp(c)).call()
+                  if (r.isSuccessful) "Pulled. ${r.mergeResult?.mergeStatus ?: ""}" else "Pull failed: $r"
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/filetree
+          cat > app/src/main/java/com/example/filetree/Highlight.kt <<'EOF_FILE'
+          package com.example.filetree
+
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.text.SpanStyle
+          import androidx.compose.ui.text.input.OffsetMapping
+          import androidx.compose.ui.text.input.TransformedText
+          import androidx.compose.ui.text.input.VisualTransformation
+
+          /** Language-agnostic highlighter: keywords, numbers, strings, comments. */
+          class CodeHighlight(dark: Boolean) : VisualTransformation {
+              private val kw = if (dark) Color(0xFFFF7B72) else Color(0xFFD73A49)
+              private val str = if (dark) Color(0xFFA5D6FF) else Color(0xFF032F62)
+              private val com = if (dark) Color(0xFF8B949E) else Color(0xFF6A737D)
+              private val num = if (dark) Color(0xFF79C0FF) else Color(0xFF005CC5)
+
+              override fun filter(text: AnnotatedString): TransformedText {
+                  val s = text.text
+                  val b = AnnotatedString.Builder(s)
+                  fun mark(r: Regex, c: Color) =
+                      r.findAll(s).forEach { b.addStyle(SpanStyle(color = c), it.range.first, it.range.last + 1) }
+                  mark(NUM, num); mark(KW, kw); mark(STR, str); mark(COMMENT, com)
+                  return TransformedText(b.toAnnotatedString(), OffsetMapping.Identity)
+              }
+
+              companion object {
+                  val KW = Regex("\\b(fun|val|var|def|class|import|from|return|if|else|elif|for|while|in|is|not|and|or|function|const|let|new|public|private|protected|static|void|int|float|double|string|bool|true|false|null|None|True|False|try|catch|except|finally|throw|raise|async|await|package|struct|enum|interface|override|when|switch|case|break|continue|self|this|with|as|yield|lambda|export|default|extends|implements|fn|mut|use|impl|pub|match)\\b")
+                  val NUM = Regex("\\b\\d+(\\.\\d+)?\\b")
+                  val STR = Regex("\"(?:\\\\.|[^\"\\\\\\n])*\"|'(?:\\\\.|[^'\\\\\\n])*'")
+                  val COMMENT = Regex("//[^\\n]*|#[^\\n]*|/\\*[\\s\\S]*?\\*/")
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/filetree
+          cat > app/src/main/java/com/example/filetree/MainActivity.kt <<'EOF_FILE'
+          package com.example.filetree
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.compose.foundation.*
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.text.BasicTextField
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.foundation.text.selection.SelectionContainer
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.text.TextRange
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.input.*
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge()
+                  System.setProperty("user.home", filesDir.absolutePath) // JGit needs a home dir
+                  val root = File(filesDir, "root").apply { mkdirs() }
+                  val creds = Creds(this)
+                  setContent {
+                      MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+                          Surface(Modifier.fillMaxSize()) { App(root, creds) }
+                      }
+                  }
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun App(root: File, creds: Creds) {
+              var dir by remember { mutableStateOf(root) }
+              var editing by remember { mutableStateOf<File?>(null) }
+              var showGit by remember { mutableStateOf(false) }
+              var tick by remember { mutableIntStateOf(0) }
+              var creating by remember { mutableStateOf<String?>(null) }
+              var deleting by remember { mutableStateOf<File?>(null) }
+
+              BackHandler(dir != root) { dir = dir.parentFile ?: root }
+
+              val ed = editing
+              when {
+                  ed != null -> Editor(ed) { editing = null }
+                  showGit -> GitScreen(dir, root, creds, onChanged = { tick++ }) { showGit = false }
+                  else -> {
+                      val items = remember(dir, tick) {
+                          dir.listFiles()?.filter { it.name != ".git" }
+                              ?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() })) ?: emptyList()
+                      }
+                      Scaffold(
+                          topBar = {
+                              TopAppBar(
+                                  title = { Text("/" + dir.relativeTo(root).path) },
+                                  navigationIcon = {
+                                      if (dir != root) TextButton(onClick = { dir = dir.parentFile ?: root }) { Text("←") }
+                                  },
+                                  actions = { TextButton(onClick = { showGit = true }) { Text("Git") } }
+                              )
+                          },
+                          bottomBar = {
+                              Row(
+                                  Modifier.fillMaxWidth().navigationBarsPadding().padding(12.dp),
+                                  horizontalArrangement = Arrangement.spacedBy(12.dp)
+                              ) {
+                                  Button(onClick = { creating = "folder" }, modifier = Modifier.weight(1f)) { Text("📁 New folder") }
+                                  Button(onClick = { creating = "file" }, modifier = Modifier.weight(1f)) { Text("📄 New file") }
+                              }
+                          }
+                      ) { pad ->
+                          if (items.isEmpty()) Box(Modifier.padding(pad).fillMaxSize(), contentAlignment = Alignment.Center) {
+                              Text("Empty folder")
+                          } else LazyColumn(Modifier.padding(pad)) {
+                              items(items, key = { it.absolutePath }) { f ->
+                                  Row(
+                                      Modifier.fillMaxWidth()
+                                          .clickable { if (f.isDirectory) dir = f else editing = f }
+                                          .padding(horizontal = 16.dp, vertical = 14.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Text(if (f.isDirectory) "📁" else "📄")
+                                      Spacer(Modifier.width(12.dp))
+                                      Text(f.name, Modifier.weight(1f))
+                                      TextButton(onClick = { deleting = f }) { Text("🗑") }
+                                  }
+                                  HorizontalDivider()
+                              }
+                          }
+                      }
+                  }
+              }
+
+              creating?.let { kind ->
+                  var name by remember { mutableStateOf("") }
+                  val bad = name.isBlank() || name == "." || name == ".." || '/' in name || File(dir, name.trim()).exists()
+                  AlertDialog(
+                      onDismissRequest = { creating = null },
+                      title = { Text(if (kind == "file") "New file" else "New folder") },
+                      text = {
+                          OutlinedTextField(
+                              value = name, onValueChange = { name = it }, singleLine = true,
+                              label = { Text(if (kind == "file") "e.g. main.py, notes.tag" else "Folder name") }
+                          )
+                      },
+                      confirmButton = {
+                          TextButton(enabled = !bad, onClick = {
+                              val f = File(dir, name.trim())
+                              if (kind == "folder") f.mkdirs() else { f.createNewFile(); editing = f }
+                              tick++; creating = null
+                          }) { Text("Create") }
+                      },
+                      dismissButton = { TextButton(onClick = { creating = null }) { Text("Cancel") } }
+                  )
+              }
+
+              deleting?.let { f ->
+                  AlertDialog(
+                      onDismissRequest = { deleting = null },
+                      title = { Text("Delete ${f.name}?") },
+                      text = { if (f.isDirectory) Text("This deletes everything inside it too.") },
+                      confirmButton = { TextButton(onClick = { f.deleteRecursively(); tick++; deleting = null }) { Text("Delete") } },
+                      dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel") } }
+                  )
+              }
+          }
+
+          private val SYMBOLS = listOf(
+              Triple("⇥", "    ", 0), Triple("{ }", "{}", 1), Triple("( )", "()", 1), Triple("[ ]", "[]", 1),
+              Triple("\" \"", "\"\"", 1), Triple("' '", "''", 1), Triple(";", ";", 0), Triple(":", ":", 0),
+              Triple("=", "=", 0), Triple("<", "<", 0), Triple(">", ">", 0), Triple("/", "/", 0),
+              Triple("#", "#", 0), Triple("_", "_", 0), Triple("|", "|", 0), Triple("&", "&", 0),
+              Triple("!", "!", 0), Triple("\\", "\\", 0)
+          )
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun Editor(file: File, onClose: () -> Unit) {
+              val raw = remember(file) { runCatching { file.readBytes() }.getOrDefault(ByteArray(0)) }
+              val unreadable = raw.size > 1_000_000 || raw.any { it == 0.toByte() }
+              var tf by remember(file) { mutableStateOf(TextFieldValue(if (unreadable) "" else String(raw))) }
+              var dirty by remember(file) { mutableStateOf(false) }
+              val dark = isSystemInDarkTheme()
+              val hl = remember(dark) { CodeHighlight(dark) }
+
+              fun save() { if (!unreadable) { file.writeText(tf.text); dirty = false } }
+              fun insert(s: String, back: Int) {
+                  val sel = tf.selection
+                  tf = TextFieldValue(tf.text.replaceRange(sel.min, sel.max, s), TextRange(sel.min + s.length - back))
+                  dirty = true
+              }
+              BackHandler { save(); onClose() }
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(
+                          title = { Text(file.name + if (dirty) " •" else "") },
+                          navigationIcon = { TextButton(onClick = { save(); onClose() }) { Text("←") } },
+                          actions = { TextButton(onClick = { save() }) { Text("Save") } }
+                      )
+                  }
+              ) { pad ->
+                  Column(Modifier.padding(pad).imePadding()) {
+                      if (unreadable) {
+                          Text("Binary or too large (>1 MB) to edit.", Modifier.padding(16.dp))
+                      } else {
+                          BasicTextField(
+                              value = tf,
+                              onValueChange = { if (it.text != tf.text) dirty = true; tf = it },
+                              visualTransformation = hl,
+                              textStyle = TextStyle(
+                                  fontFamily = FontFamily.Monospace, fontSize = 14.sp,
+                                  color = MaterialTheme.colorScheme.onSurface
+                              ),
+                              cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                              keyboardOptions = KeyboardOptions(
+                                  capitalization = KeyboardCapitalization.None, autoCorrect = false
+                              ),
+                              modifier = Modifier.weight(1f).fillMaxWidth()
+                                  .verticalScroll(rememberScrollState()).padding(8.dp)
+                          )
+                          HorizontalDivider()
+                          Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 4.dp)) {
+                              SYMBOLS.forEach { (label, text, back) ->
+                                  TextButton(
+                                      onClick = { insert(text, back) },
+                                      contentPadding = PaddingValues(horizontal = 12.dp)
+                                  ) { Text(label, fontFamily = FontFamily.Monospace, fontSize = 16.sp) }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun Field(label: String, value: String, secret: Boolean = false, onChange: (String) -> Unit) {
+              OutlinedTextField(
+                  value = value, onValueChange = onChange, label = { Text(label) }, singleLine = true,
+                  visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
+                  keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None, autoCorrect = false),
+                  modifier = Modifier.fillMaxWidth()
+              )
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun GitScreen(dir: File, root: File, creds: Creds, onChanged: () -> Unit, onClose: () -> Unit) {
+              BackHandler(onBack = onClose)
+              val scope = rememberCoroutineScope()
+              var rev by remember { mutableIntStateOf(0) }
+              val repo = remember(dir, rev) { GitOps.repoRoot(dir, root) }
+              var user by remember { mutableStateOf(creds.user) }
+              var token by remember { mutableStateOf(creds.token) }
+              var name by remember { mutableStateOf(creds.name) }
+              var email by remember { mutableStateOf(creds.email) }
+              var cloneUrl by remember { mutableStateOf("") }
+              var remote by remember(repo) { mutableStateOf(repo?.let { GitOps.remoteUrl(it) } ?: "") }
+              var msg by remember { mutableStateOf("") }
+              var log by remember { mutableStateOf("") }
+              var busy by remember { mutableStateOf(false) }
+
+              fun run(label: String, block: () -> String) {
+                  busy = true
+                  scope.launch {
+                      val out = withContext(Dispatchers.IO) {
+                          try { block() } catch (e: Throwable) { "Error: ${e.message ?: e}" }
+                      }
+                      log = "▸ $label\n$out\n\n$log"; busy = false; rev++; onChanged()
+                  }
+              }
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(
+                          title = { Text("Git") },
+                          navigationIcon = { TextButton(onClick = onClose) { Text("←") } }
+                      )
+                  }
+              ) { pad ->
+                  Column(
+                      Modifier.padding(pad).imePadding().verticalScroll(rememberScrollState()).padding(16.dp),
+                      verticalArrangement = Arrangement.spacedBy(10.dp)
+                  ) {
+                      if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+
+                      Text("Account (works for GitHub, GitLab, Bitbucket, any HTTPS remote)", style = MaterialTheme.typography.titleSmall)
+                      Field("Username", user) { user = it; creds.user = it }
+                      Field("Personal access token", token, secret = true) { token = it; creds.token = it }
+                      Field("Author name", name) { name = it; creds.name = it }
+                      Field("Author email", email) { email = it; creds.email = it }
+
+                      HorizontalDivider()
+                      Text("Clone into /" + dir.relativeTo(root).path, style = MaterialTheme.typography.titleSmall)
+                      Field("Repo URL (https://…)", cloneUrl) { cloneUrl = it }
+                      Button(enabled = !busy && cloneUrl.isNotBlank(), onClick = { run("clone") { GitOps.clone(cloneUrl, dir, creds) } }) {
+                          Text("Clone")
+                      }
+
+                      HorizontalDivider()
+                      if (repo == null) {
+                          Text("This folder isn't inside a Git repo.")
+                          Button(enabled = !busy, onClick = { run("init") { GitOps.init(dir); "Initialized repo" } }) { Text("Init here") }
+                      } else {
+                          Text("Repo: /" + repo.relativeTo(root).path, style = MaterialTheme.typography.titleSmall)
+                          Field("Remote (origin) URL", remote) { remote = it }
+                          OutlinedButton(enabled = !busy && remote.isNotBlank(), onClick = { run("set remote") { GitOps.setRemote(repo, remote) } }) {
+                              Text("Set origin")
+                          }
+                          Field("Commit message", msg) { msg = it }
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              OutlinedButton(enabled = !busy, onClick = { run("status") { GitOps.status(repo) } }, modifier = Modifier.weight(1f)) { Text("Status") }
+                              OutlinedButton(enabled = !busy, onClick = { run("pull") { GitOps.pull(repo, creds) } }, modifier = Modifier.weight(1f)) { Text("Pull") }
+                          }
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              Button(enabled = !busy, onClick = { run("commit") { GitOps.commit(repo, msg, creds) } }, modifier = Modifier.weight(1f)) { Text("Commit") }
+                              Button(enabled = !busy, onClick = { run("push") { GitOps.push(repo, creds) } }, modifier = Modifier.weight(1f)) { Text("Push") }
+                          }
+                          FilledTonalButton(
+                              enabled = !busy, modifier = Modifier.fillMaxWidth(),
+                              onClick = { run("commit & push") { GitOps.commit(repo, msg, creds) + "\n" + GitOps.push(repo, creds) } }
+                          ) { Text("Commit & push") }
+                      }
+
+                      if (log.isNotBlank()) SelectionContainer {
+                          Text(log, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          EOF_FILE
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "FileTree"
+          include(":app")
+          EOF_FILE
+      - name: Build debug APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FileTree-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
